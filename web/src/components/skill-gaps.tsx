@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import Link from "next/link";
 import { GraduationCap, TriangleAlert } from "lucide-react";
 import { skillGapModel, barPct } from "@/lib/skill-gaps.mjs";
@@ -25,7 +25,7 @@ const TIER_CLASS: Record<string, string> = {
 export function SkillGaps() {
   const [model, setModel] = useState<SkillGapModel | null>(null);
 
-  useEffect(() => {
+  const load = useCallback(() => {
     let alive = true;
     fetch("/api/upskill")
       .then((r) => (r.ok ? r.json() : Promise.reject(new Error(String(r.status)))))
@@ -35,6 +35,20 @@ export function SkillGaps() {
       alive = false;
     };
   }, []);
+
+  useEffect(() => {
+    const cancel = load();
+    // The gap map subtracts the skills already in cv.md, so editing the CV
+    // directly above this panel changes its answer. Loading once left the list
+    // describing the document as it was before the save — stale in the one place
+    // the user just acted.
+    const onSaved = () => load();
+    window.addEventListener("co-cv-saved", onSaved);
+    return () => {
+      cancel();
+      window.removeEventListener("co-cv-saved", onSaved);
+    };
+  }, [load]);
 
   if (!model) {
     return (
@@ -57,6 +71,10 @@ export function SkillGaps() {
           No recurring gaps yet. These are read from each report&apos;s Machine Summary and Gap table, so they appear
           once a few evaluations are in.
         </p>
+        {/* The caveats belong here too. "No gaps" read off a CV whose skills
+            could not be recognised, or off a fraction of the reports, is the
+            most believable wrong answer this panel can give. */}
+        <Caveats caveats={model.caveats} />
       </section>
     );
   }
@@ -65,12 +83,7 @@ export function SkillGaps() {
     <section className="mt-8 rounded-2xl border border-border bg-surface/40 px-5 py-4">
       <Header />
 
-      {model.caveats.map((c) => (
-        <p key={c.kind} className="mt-2 flex items-start gap-2 text-xs text-muted">
-          <TriangleAlert className="mt-0.5 size-3.5 shrink-0 text-faint" aria-hidden />
-          <span>{c.text}</span>
-        </p>
-      ))}
+      <Caveats caveats={model.caveats} />
 
       <div className="mt-4 grid gap-2.5">
         {model.gaps.map((g) => (
@@ -99,6 +112,20 @@ export function SkillGaps() {
         </Link>
       </p>
     </section>
+  );
+}
+
+/** The core's caveats, shared by the populated and empty panels. */
+function Caveats({ caveats }: { caveats: SkillGapModel["caveats"] }) {
+  return (
+    <>
+      {caveats.map((c) => (
+        <p key={c.kind} className="mt-2 flex items-start gap-2 text-xs text-muted">
+          <TriangleAlert className="mt-0.5 size-3.5 shrink-0 text-faint" aria-hidden />
+          <span>{c.text}</span>
+        </p>
+      ))}
+    </>
   );
 }
 

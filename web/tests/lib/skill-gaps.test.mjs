@@ -40,10 +40,24 @@ test("a map drawn from a minority of reports says so", () => {
   assert.equal(ok.caveats.find((x) => x.kind === "thin-coverage"), undefined);
 });
 
-test("no Machine Summaries at all is not reported as thin coverage", () => {
-  // Zero is the "nothing to read" case, and upskill returns no gaps for it —
-  // a coverage ratio of 0 of 9 would be noise next to an empty list.
-  const m = skillGapModel(payload({ reportsWithMachineSummary: 0 }, []));
+test("gaps from Gap tables alone are still flagged as thin", () => {
+  // The case the first version got wrong. upskill.mjs reads a report's Gap
+  // TABLE as well as its Machine Summary — verified against the core:
+  // parseReportGaps() on a table-only report returns hasMachineSummary false
+  // and the gap text anyway. So a pipeline with ZERO summaries can produce a
+  // full gap map, and gating the caveat on `withMs > 0` suppressed it in
+  // precisely the thinnest case.
+  const m = skillGapModel(payload({ reportsRead: 9, reportsWithMachineSummary: 0 }));
+  assert.equal(m.gaps.length, 2, "the gaps are real and still shown");
+  const c = m.caveats.find((x) => x.kind === "thin-coverage");
+  assert.ok(c, "zero summaries with gaps present must be flagged");
+  assert.match(c.text, /None of the 9 reports/);
+  assert.doesNotMatch(c.text, /Based on 0 of 9/, "the zero case gets its own wording, not an odd ratio");
+});
+
+test("an empty gap map is not flagged as thin", () => {
+  // Nothing to qualify — a coverage ratio beside an empty list is noise.
+  const m = skillGapModel(payload({ reportsRead: 9, reportsWithMachineSummary: 0 }, []));
   assert.equal(m.gaps.length, 0);
   assert.equal(m.caveats.find((x) => x.kind === "thin-coverage"), undefined);
 });

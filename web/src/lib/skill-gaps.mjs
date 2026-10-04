@@ -57,15 +57,25 @@ export function skillGapModel(payload, limit = 8) {
     });
   }
 
-  // Gaps come from reports carrying a Machine Summary. When most reports have
-  // none, the map is drawn from a minority of the pipeline and says less about
-  // the search than its confident ordering suggests.
+  // When most reports carry no Machine Summary, the map is drawn from a minority
+  // of the pipeline and says less about the search than its confident ordering
+  // suggests.
+  //
+  // The gate is on GAPS, not on withMs. upskill.mjs reads a report's Gap TABLE
+  // as well as its Machine Summary, so a pipeline with zero summaries can still
+  // produce a full gap map — and the previous `withMs > 0` condition suppressed
+  // the warning in exactly that case, the one where coverage is thinnest.
+  // Verified against the core: parseReportGaps() on a report with only a Gap
+  // table returns hasMachineSummary false and the gap text all the same.
   const withMs = num(m.reportsWithMachineSummary);
   const read = num(m.reportsRead);
-  if (read > 0 && withMs > 0 && withMs * 2 < read) {
+  if (gaps.length > 0 && read > 0 && withMs * 2 < read) {
     caveats.push({
       kind: "thin-coverage",
-      text: `Based on ${withMs} of ${read} reports — the rest carry no Machine Summary to read gaps from.`,
+      text:
+        withMs === 0
+          ? `None of the ${read} reports carry a Machine Summary — these come from Gap tables alone.`
+          : `Based on ${withMs} of ${read} reports — the rest carry no Machine Summary to read gaps from.`,
     });
   }
 
