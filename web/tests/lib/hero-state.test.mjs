@@ -8,7 +8,7 @@
 
 import test from "node:test";
 import assert from "node:assert/strict";
-import { resolveHeroState, mayClaimAllClear } from "../../src/lib/home/hero-state.mjs";
+import { resolveHeroState, mayClaimAllClear, hasMissingData, showsQueue } from "../../src/lib/home/hero-state.mjs";
 
 test("pending loops never read as all clear", () => {
   const state = resolveHeroState({ loops: "pending" });
@@ -37,11 +37,43 @@ test("settled with nothing to do is the only all clear", () => {
   assert.equal(mayClaimAllClear(state), true);
 });
 
+test("a failure alongside known work is partial, not plain queue", () => {
+  // The two facts are independent: "here is what I found" and "one source did
+  // not answer". Collapsing them into `queue` shows a partial queue as if it
+  // were the whole one — a quieter version of the same overclaim this module
+  // exists to stop.
+  const partial = resolveHeroState({ loops: "failed", overdue: 3 });
+  assert.equal(partial, "queue-partial");
+  assert.equal(showsQueue(partial), true, "the counts are real and must still render");
+  assert.equal(hasMissingData(partial), true, "and the gap must still be stated");
+  assert.equal(mayClaimAllClear(partial), false);
+
+  // With everything answered it is a plain queue, with nothing to warn about.
+  const whole = resolveHeroState({ loops: "settled", overdue: 3 });
+  assert.equal(whole, "queue");
+  assert.equal(showsQueue(whole), true);
+  assert.equal(hasMissingData(whole), false);
+
+  // Pending plus known work stays a plain queue: nothing has failed, the rest is
+  // merely not in yet.
+  assert.equal(resolveHeroState({ loops: "pending", awaitingCount: 2 }), "queue");
+});
+
+test("hasMissingData covers both ways data can be missing", () => {
+  // A caller must not be able to surface the bare failure and forget the partial
+  // one — that was the shape of the original bug, one state handled and another
+  // falling through.
+  assert.equal(hasMissingData("unavailable"), true);
+  assert.equal(hasMissingData("queue-partial"), true);
+  for (const s of ["loading", "queue", "all-clear"]) assert.equal(hasMissingData(s), false, s);
+  for (const s of ["loading", "unavailable", "all-clear"]) assert.equal(showsQueue(s), false, s);
+});
+
 test("work outranks loading, so a known row shows immediately", () => {
   // awaitingCount is a server prop: trustworthy on first paint, and a scored row
   // awaiting a decision should not sit behind a spinner.
   assert.equal(resolveHeroState({ loops: "pending", awaitingCount: 2 }), "queue");
-  assert.equal(resolveHeroState({ loops: "failed", awaitingCount: 2 }), "queue");
+  assert.equal(resolveHeroState({ loops: "failed", awaitingCount: 2 }), "queue-partial");
   assert.equal(resolveHeroState({ loops: "settled", overdue: 1 }), "queue");
   assert.equal(resolveHeroState({ loops: "settled", newThisWeek: 5 }), "queue");
 });
@@ -61,7 +93,7 @@ test("counters that are not positive integers cannot invent work", () => {
 
 test("mayClaimAllClear is closed against new states", () => {
   // Adding a state must not become an all-clear by omission.
-  for (const s of ["loading", "unavailable", "queue"]) {
+  for (const s of ["loading", "unavailable", "queue", "queue-partial"]) {
     assert.equal(mayClaimAllClear(/** @type {never} */ (s)), false);
   }
 });

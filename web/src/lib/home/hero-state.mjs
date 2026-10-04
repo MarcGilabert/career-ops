@@ -29,7 +29,7 @@
 // So the hero reads a state, not a count comparison. "All clear" is a claim
 // about resolved data and is reachable only from `settled`.
 
-/** @typedef {"loading"|"all-clear"|"queue"|"unavailable"} HeroState */
+/** @typedef {"loading"|"all-clear"|"queue"|"queue-partial"|"unavailable"} HeroState */
 
 /**
  * Resolve what the hero may say.
@@ -40,10 +40,11 @@
  * @param {number} [input.overdue] - Follow-ups due now (demand loop).
  * @param {number} [input.awaitingCount] - Scored rows awaiting a decision (server prop).
  * @returns {HeroState}
- *   `loading`     — counters not resolved yet; claim nothing either way.
- *   `unavailable` — a loop failed; there may be work we cannot see.
- *   `queue`       — there is something to do.
- *   `all-clear`   — resolved, and genuinely nothing to do.
+ *   `loading`       — counters not resolved yet; claim nothing either way.
+ *   `unavailable`   — a loop failed and nothing is known; there may be work we cannot see.
+ *   `queue-partial` — a loop failed, but the rest already shows real work.
+ *   `queue`         — there is something to do, and everything answered.
+ *   `all-clear`     — resolved, and genuinely nothing to do.
  */
 export function resolveHeroState({ loops, newThisWeek = 0, overdue = 0, awaitingCount = 0 }) {
   const n = (v) => (Number.isFinite(v) && v > 0 ? Math.trunc(v) : 0);
@@ -52,10 +53,38 @@ export function resolveHeroState({ loops, newThisWeek = 0, overdue = 0, awaiting
   // Work we already know about outranks every other state: `awaitingCount` is a
   // server prop, so it is trustworthy on first paint, and a row awaiting a
   // decision is worth showing immediately rather than behind a spinner.
-  if (work > 0) return "queue";
+  //
+  // But a failure alongside it is not swallowed. The two facts are independent —
+  // "here is what I found" and "one source did not answer" — and collapsing them
+  // into `queue` would show a partial queue as if it were the whole one, which is
+  // a quieter version of the same overclaim this module exists to stop.
+  if (work > 0) return loops === "failed" ? "queue-partial" : "queue";
   if (loops === "failed") return "unavailable";
   if (loops === "pending") return "loading";
   return "all-clear";
+}
+
+/**
+ * Whether the hero should say that some of its data is missing.
+ *
+ * True for a bare failure AND for a partial queue, so a caller cannot surface
+ * the first and forget the second.
+ *
+ * @param {HeroState} state
+ * @returns {boolean}
+ */
+export function hasMissingData(state) {
+  return state === "unavailable" || state === "queue-partial";
+}
+
+/**
+ * Whether the hero should render its counts.
+ *
+ * @param {HeroState} state
+ * @returns {boolean}
+ */
+export function showsQueue(state) {
+  return state === "queue" || state === "queue-partial";
 }
 
 /**
