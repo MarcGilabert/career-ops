@@ -22,10 +22,18 @@
  * @typedef {"finding"|"absence"|"not-checked"} Kind
  * @typedef {{kind: Kind, headline: string, detail: string|null}} Verdict
  *
- * One tracker row behind a responsiveness verdict. Every field is optional
- * because the shape is whatever company-history.mjs put there, and the card
- * renders what it finds rather than requiring a contract it does not own.
- * @typedef {{num?: number|string, outcome?: string, date?: string, stale?: boolean, dateBasis?: string}} ResponsivenessFact
+ * One tracker row behind a responsiveness verdict.
+ *
+ * TWO SHAPES, and the card has to read both. A responded fact carries
+ * `outcome` and `date`; a SILENT one carries `appliedDate`, `silentDays`,
+ * `status` and `followupsSent` and has neither. Rendering only the first pair
+ * printed silent rows with an empty outcome and no date at all.
+ *
+ * Every field is optional because the shape is whatever company-history.mjs put
+ * there, and the card renders what it finds rather than asserting a contract it
+ * does not own.
+ * @typedef {{num?: number|string, outcome?: string, date?: string, stale?: boolean, dateBasis?: string,
+ *            appliedDate?: string, silentDays?: number, status?: string, followupsSent?: number}} ResponsivenessFact
  *
  * @typedef {{available: boolean, reason: string|null, company: string|null,
  *            responsiveness: Verdict|null, churn: Verdict|null,
@@ -58,6 +66,14 @@ const RESPONSIVENESS = {
 
 /** Churn labels. Two of these mean the check did not run. */
 const CHURN = {
+  // The one that actually says something. Omitting it made the card fall through
+  // to "Not evaluated" exactly when the core HAD found re-listings — silent at
+  // the only moment it had news.
+  "reposts-detected": {
+    kind: "finding",
+    headline: "This role keeps being re-listed",
+    detail: "The same posting has reappeared across scans, which can mean the role is not really open.",
+  },
   "none-detected": {
     kind: "absence",
     headline: "No repeat postings found",
@@ -135,4 +151,37 @@ export function verdictFor(table, label) {
  */
 export function isConclusion(verdict) {
   return verdict?.kind === "finding" || verdict?.kind === "absence";
+}
+
+/**
+ * One fact as a line of text, reading whichever shape it is.
+ *
+ * Returns null when there is nothing to say, so the caller drops the row rather
+ * than rendering bullets of punctuation.
+ *
+ * @param {ResponsivenessFact} f
+ * @returns {string|null}
+ */
+export function factLine(f) {
+  if (!f || typeof f !== "object") return null;
+  const bits = [];
+  if (f.num !== undefined && f.num !== null && String(f.num).trim() !== "") bits.push(`#${String(f.num).trim()}`);
+
+  // A silent fact has no outcome — its content is how long the silence has run,
+  // and whether the user chased it.
+  if (Number.isFinite(f.silentDays)) {
+    bits.push(`no reply in ${Math.trunc(f.silentDays)} days`);
+    if (typeof f.appliedDate === "string" && f.appliedDate.trim() !== "") bits.push(`applied ${f.appliedDate.trim()}`);
+    if (Number.isFinite(f.followupsSent) && f.followupsSent > 0) {
+      bits.push(`${Math.trunc(f.followupsSent)} follow-up${f.followupsSent === 1 ? "" : "s"} sent`);
+    }
+  } else {
+    if (typeof f.outcome === "string" && f.outcome.trim() !== "") bits.push(f.outcome.trim());
+    const date = typeof f.date === "string" && f.date.trim() !== "" ? f.date.trim() : null;
+    if (date) bits.push(date);
+  }
+
+  if (f.stale === true) bits.push("stale");
+  // A row that is only its own number tells the reader nothing they can use.
+  return bits.length > 1 ? bits.join(" · ") : null;
 }

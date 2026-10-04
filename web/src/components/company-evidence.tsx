@@ -2,7 +2,7 @@
 
 import { useEffect, useState } from "react";
 import { Building2, CircleCheck, CircleSlash, CircleHelp } from "lucide-react";
-import { companyCardModel, isConclusion } from "@/lib/company-history.mjs";
+import { companyCardModel, isConclusion, factLine } from "@/lib/company-history.mjs";
 import type { CompanyCardModel, Verdict } from "@/lib/company-history.mjs";
 
 // What the tracker already knows about this company, from the core's
@@ -49,6 +49,11 @@ export function CompanyEvidence({ company }: { company: string }) {
   // checkout" is not something the reader can act on from here.
   if (!model.available) return null;
 
+  const factLines = model.facts
+    .slice(0, 5)
+    .map((f) => factLine(f))
+    .filter((l): l is string => typeof l === "string");
+
   return (
     <section className="mt-8 rounded-2xl border border-border bg-surface/40 px-5 py-4">
       <div className="flex flex-wrap items-center gap-2">
@@ -61,13 +66,16 @@ export function CompanyEvidence({ company }: { company: string }) {
         <Row verdict={model.churn} />
       </div>
 
-      {model.facts.length > 0 && (
+      {/* factLine() reads BOTH fact shapes: a responded fact has outcome+date, a
+          silent one has silentDays+appliedDate and neither. Printing only the
+          first pair rendered silent rows as "#4 · — " with no date. A fact with
+          nothing to say returns null and is dropped rather than shown as
+          punctuation. */}
+      {factLines.length > 0 && (
         <ul className="mt-3 grid gap-1">
-          {model.facts.slice(0, 5).map((f, i) => (
+          {factLines.map((line, i) => (
             <li key={i} className="text-xs text-faint">
-              #{String(f.num ?? "?")} · {String(f.outcome ?? "—")}
-              {f.date ? ` · ${String(f.date)}` : ""}
-              {f.stale ? " · stale" : ""}
+              {line}
             </li>
           ))}
         </ul>

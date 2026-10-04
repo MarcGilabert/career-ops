@@ -8,7 +8,7 @@
 
 import test from "node:test";
 import assert from "node:assert/strict";
-import { companyCardModel, verdictFor, isConclusion } from "../../src/lib/company-history.mjs";
+import { companyCardModel, verdictFor, isConclusion, factLine } from "../../src/lib/company-history.mjs";
 
 const card = (over = {}) => ({
   available: true,
@@ -21,6 +21,63 @@ const card = (over = {}) => ({
     explanations: [],
     ...over,
   },
+});
+
+test("reposts-detected is a finding, not an unrecognised label", () => {
+  // The label the core emits when it HAS found re-listings. It was missing from
+  // the table, so the card fell through to "Not evaluated" — silent at the one
+  // moment it had something to say.
+  const m = companyCardModel(card({ postingChurn: { label: "reposts-detected", clusters: [{ title: "Platform Lead" }] } }));
+  assert.equal(m.churn.kind, "finding");
+  assert.equal(isConclusion(m.churn), true);
+  assert.match(m.churn.headline, /re-listed/i);
+  assert.doesNotMatch(m.churn.headline, /not evaluated/i);
+});
+
+test("every churn label the core emits is mapped", () => {
+  // This file already promises "every label the core emits" for responsiveness;
+  // the churn side needs the same, since that is how reposts-detected was missed.
+  for (const [label, kind] of [
+    ["reposts-detected", "finding"],
+    ["none-detected", "absence"],
+    ["no-scan-data", "not-checked"],
+    ["aggregator-not-evaluated", "not-checked"],
+  ]) {
+    const m = companyCardModel(card({ postingChurn: { label, clusters: [] } }));
+    assert.equal(m.churn.kind, kind, label);
+    assert.doesNotMatch(m.churn.headline, /not evaluated/i, `${label} must not read as unrecognised`);
+  }
+});
+
+test("a silent fact renders its own fields, not an empty outcome", () => {
+  // Two fact shapes. A responded fact has outcome+date; a SILENT one has
+  // silentDays/appliedDate/followupsSent and neither — so printing only the
+  // first pair gave "#4 · —" with no date.
+  const silent = factLine({ num: 4, appliedDate: "2026-07-02", status: "Applied", silentDays: 61, followupsSent: 2 });
+  assert.match(silent, /#4/);
+  assert.match(silent, /no reply in 61 days/);
+  assert.match(silent, /applied 2026-07-02/);
+  assert.match(silent, /2 follow-ups sent/);
+  assert.doesNotMatch(silent, /—|undefined|NaN/);
+
+  // One follow-up is singular; zero is not mentioned at all.
+  assert.match(factLine({ num: 5, silentDays: 30, followupsSent: 1 }), /1 follow-up sent/);
+  assert.doesNotMatch(factLine({ num: 5, silentDays: 30, followupsSent: 0 }), /follow-up/);
+
+  // The responded shape still reads the way it did.
+  const responded = factLine({ num: 2, outcome: "Interview", date: "2026-09-03" });
+  assert.equal(responded, "#2 · Interview · 2026-09-03");
+
+  // stale is appended to either shape.
+  assert.match(factLine({ num: 9, silentDays: 400, stale: true }), /stale$/);
+  assert.match(factLine({ num: 9, outcome: "Applied", date: "2025-01-01", stale: true }), /stale$/);
+
+  // A fact with nothing but its own number is dropped rather than rendered as
+  // punctuation.
+  assert.equal(factLine({ num: 7 }), null);
+  assert.equal(factLine({}), null);
+  assert.equal(factLine(null), null);
+  assert.equal(factLine("nope"), null);
 });
 
 test("a checked-and-empty result is a conclusion; an unchecked one is not", () => {
