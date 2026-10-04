@@ -45,6 +45,26 @@ function routeDirs(dir, acc = []) {
   return acc;
 }
 
+/**
+ * Source with comments and string/template literals blanked out.
+ *
+ * Crude on purpose — it does not parse TS, it just removes the regions where a
+ * phrase is not code. Erring toward blanking is the safe direction: it can only
+ * move a file INTO the offender list, which fails loudly, never quietly out of
+ * it.
+ *
+ * @param {string} src
+ * @returns {string}
+ */
+function codeOnly(src) {
+  return src
+    .replace(/\/\*[\s\S]*?\*\//g, " ")
+    .replace(/(^|[^:])\/\/[^\n]*/g, "$1 ")
+    .replace(/`(?:\\.|[^`\\])*`/g, "``")
+    .replace(/'(?:\\.|[^'\\\n])*'/g, "''")
+    .replace(/"(?:\\.|[^"\\\n])*"/g, '""');
+}
+
 const routes = routeDirs(APP);
 
 test("the app still has the routes this check is meant to cover", () => {
@@ -97,7 +117,12 @@ test("every loading state exports a component", () => {
       continue; // absence is the previous test's job to report
     }
     const rel = relative(APP, d).split(sep).join("/") || "/";
-    if (!/export\s+default/.test(src)) empty.push(`${rel}: no default export`);
+    // Comments and string literals are blanked first. `/export\s+default/` over
+    // raw source matches the phrase in a comment explaining the file, or inside
+    // a string — so a loading.tsx that only TALKS about a default export would
+    // have passed. Same reasoning as the help-flag ratchet: the match has to
+    // come from code.
+    if (!/export\s+default/.test(codeOnly(src))) empty.push(`${rel}: no default export`);
   }
   assert.deepEqual(empty, [], `loading states with nothing to render:\n    ${empty.join("\n    ")}`);
 });
