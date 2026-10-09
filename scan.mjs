@@ -1447,10 +1447,27 @@ const PERMANENT_SCAN_HISTORY_STATUSES = new Set([
 ]);
 
 /**
+ * Statuses the `scan_history.recheck_after_days` TTL is allowed to release.
+ *
+ * `added` is the row a live posting leaves behind. `skipped_expired` is the row
+ * a dead one leaves (#3891), and it belongs here because a posting can be
+ * relisted: pinning the retirement for good would put the recheck the user
+ * configured out of reach for exactly the URLs most likely to come back.
+ *
+ * Everything else keeps its permanent pin. The distinction is whether the status
+ * describes a POSTING, which can change, or the URL itself — an invalid URL does
+ * not become valid and a blocked host does not become reachable because a window
+ * elapsed.
+ */
+const RECHECKABLE_SCAN_HISTORY_STATUSES = new Set(['added', 'skipped_expired']);
+
+/**
  * Statuses recorded for VISIBILITY only, which must never pin a URL for dedup.
  *
- * Every other skipped status describes the posting: a dead URL stays dead, a
- * blocked host stays blocked, so pinning it saves a later scan the work. These
+ * Every other skipped status describes the posting: a dead URL stays dead
+ * until the configured recheck window releases it (see
+ * RECHECKABLE_SCAN_HISTORY_STATUSES), a blocked host stays blocked, so pinning
+ * saves a later scan the work. These
  * two describe the user's CONFIG instead — `location_filter` and
  * `max_posting_age_days` are thresholds they edit. Pinning would mean a role
  * dropped under the old threshold never resurfaces under the new one, which is
@@ -1517,7 +1534,7 @@ export function shouldDedupScanHistoryRow({ firstSeen, status = 'added' }, { rec
     const cooldownUntil = parts[parts.length - 1];
     return today < cooldownUntil;
   }
-  if (status !== 'added') return true;
+  if (!RECHECKABLE_SCAN_HISTORY_STATUSES.has(status)) return true;
   if (recheckAfterDays == null) return true;
   const ageDays = daysBetweenIsoDates(firstSeen, today);
   if (ageDays == null) return true;
@@ -3083,8 +3100,16 @@ export async function appendToPipeline(offers, { pipelinePath = PIPELINE_PATH } 
 // appendFileSync is not atomic, so a concurrent append can interleave mid-line.
 // Both surface as rows that silently stop counting, because every reader skips
 // a malformed line quietly.
-export async function appendToScanHistory(offers, date, status = 'added') {
-  await withPipelineLock(SCAN_HISTORY_PATH, () => {
+//
+// `alreadyLocked` is for the one caller whose APPEND is decided by a READ of
+// this same file — check-liveness's expired-verdict recorder, which must hold
+// the lock across both or its plan is a check-then-act (a concurrent scanner
+// appending in between makes it write a row that is no longer needed). The
+// lock is not reentrant, so that caller cannot simply wrap this call; it takes
+// the lock itself and passes true. Everything else must leave it alone: true
+// with no lock actually held reintroduces both races described above.
+export async function appendToScanHistory(offers, date, status = 'added', { alreadyLocked = false } = {}) {
+  const write = () => {
     // Ensure file + header exist. The header is SCAN_HISTORY_COLUMNS, the same
     // list the row writer (formatScanHistoryRow) emits in order. Written ONLY
     // on fresh-file creation; existing files (including headerless legacy files
@@ -3102,7 +3127,10 @@ export async function appendToScanHistory(offers, date, status = 'added') {
     const lines = offers.map(o => formatScanHistoryRow(o, date, status)).join('\n') + '\n';
 
     appendFileSync(SCAN_HISTORY_PATH, lines, 'utf-8');
-  });
+  };
+
+  if (alreadyLocked) write();
+  else await withPipelineLock(SCAN_HISTORY_PATH, write);
 }
 
 // ── Company blacklist (#1742) ───────────────────────────────────────
