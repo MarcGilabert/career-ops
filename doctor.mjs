@@ -12,6 +12,7 @@ import { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
 import * as yaml from 'js-yaml';
 import dotenv from 'dotenv';
+import { findTitleFilterConflicts } from './lib/title-filter-conflicts.mjs';
 import { discoverPlugins, pluginRoots, pluginStatus } from './plugins/_engine.mjs';
 import { getCareerOpsRoot } from './path-resolver.mjs';
 import { validateProfile, EXAMPLE_PATH } from './validate-profile.mjs';
@@ -840,6 +841,21 @@ function checkPersonalization(root) {
 // prerequisites that AGENTS.md "First Run" lists. `--json` turns the trigger into
 // a deterministic mechanism the agent runs (instead of re-deriving it from prose),
 // and `--target <dir>` lets the test suite point it at a simulated virgin env.
+function titleFilterConflicts(root) {
+  const portalsPath = join(root, 'portals.yml');
+  if (!existsSync(portalsPath)) return null;
+  let config;
+  try {
+    config = yaml.load(readFileSync(portalsPath, 'utf-8'));
+  } catch {
+    // A portals.yml that does not parse is a different check's problem; this
+    // one only has something to say about a file it could actually read.
+    return null;
+  }
+  const { conflicts } = findTitleFilterConflicts(config?.title_filter);
+  return conflicts.length > 0 ? conflicts : null;
+}
+
 function onboardingState(root) {
   const autoCopied = [];
   const templates = [
@@ -874,6 +890,7 @@ function onboardingState(root) {
   // user-data layer and may point elsewhere under split-checkout installs.
   const mcpCheck = checkPlaywrightMcp(process.cwd(), activeCli);
   const unpersonalized = unpersonalizedFiles(root);
+  const titleFilterIssues = titleFilterConflicts(root);
   // Every other check in this function is data-layer and correctly uses this
   // function's own `root` parameter. The tracked-.bak check is the one
   // code-layer exception (#3867 finding 6) — it must read the module-level
@@ -911,6 +928,8 @@ function onboardingState(root) {
     // to be visible — surfaced as its own field the agent can branch on rather
     // than a string it has to pattern-match out of `warnings`.
     unpersonalized,
+    // Present only when it fired: a coherent title_filter adds no key.
+    ...(titleFilterIssues ? { titleFilterConflicts: titleFilterIssues } : {}),
     warnings,
     autoCopied,
     plugins,
