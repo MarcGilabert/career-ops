@@ -15,11 +15,17 @@
  */
 
 import { readFileSync, existsSync } from 'fs';
-import { fileURLToPath } from 'url';
+import { isMainModule } from './lib/is-main-module.mjs';
+import { join } from 'path';
+import { getCareerOpsRoot } from './path-resolver.mjs';
 
 // ── Config ──────────────────────────────────────────────────────────
 
-const STORY_BANK_PATH = 'interview-prep/story-bank.md';
+// From the data root, not the cwd. interview-prep/ is USER_PATHS in
+// update-system.mjs, and a bare relative path resolves against wherever the
+// process was started — so this read the checkout's story bank (usually absent)
+// for anyone whose data lives elsewhere.
+const STORY_BANK_PATH = join(getCareerOpsRoot(), 'interview-prep', 'story-bank.md');
 
 const args       = process.argv.slice(2);
 const LIST_MODE  = args.includes('--list');
@@ -199,7 +205,7 @@ export { parseStories, tokenize, score, STOPWORDS };
 
 // ── Main ─────────────────────────────────────────────────────────────
 
-if (process.argv[1] === fileURLToPath(import.meta.url)) {
+if (isMainModule(import.meta.url)) {
 if (!existsSync(STORY_BANK_PATH)) {
   console.error(`Error: ${STORY_BANK_PATH} not found.`);
   console.error('Run /career-ops interview-prep on a role first to populate your story bank.');

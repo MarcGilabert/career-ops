@@ -1,11 +1,18 @@
 // @ts-check
 /** @typedef {import('./_types.js').Provider} Provider */
+import { coerceId } from './_ids.mjs';
 
 // Lever provider — hits the public postings endpoint.
 // Auto-detects from careers_url via jobs.(eu.)?lever.co/<slug>.
 // Handles both explicit `api:` URLs and auto-detection from `careers_url`.
 
 const ALLOWED_LEVER_HOSTS = new Set(['api.lever.co', 'api.eu.lever.co']);
+
+// The v0 postings endpoint returns the whole board in one response, with every
+// description inlined, so a large board outgrows _http.mjs's 10s default:
+// jobgether is 42.8 MB and aborted at 10s on its own (#4177). Same value and
+// reasoning as ASHBY_TIMEOUT_MS, the other one-response board-wide ATS feed.
+const LEVER_TIMEOUT_MS = 30_000;
 
 /** @param {string} url */
 function assertLeverUrl(url) {
@@ -79,7 +86,7 @@ export default {
     const apiUrl = resolveApiUrl(entry);
     if (!apiUrl) throw new Error(`lever: cannot derive API URL for ${entry.name}`);
     assertLeverUrl(apiUrl);
-    const json = await ctx.fetchJson(apiUrl, { redirect: 'error' });
+    const json = await ctx.fetchJson(apiUrl, { redirect: 'error', timeoutMs: LEVER_TIMEOUT_MS });
     if (!Array.isArray(json)) return [];
     return json.map(j => ({
       title: j.text || '',
@@ -90,6 +97,9 @@ export default {
       // payload, no per-job request) — enables scan.mjs content_filter.
       description: typeof j.descriptionPlain === 'string' ? j.descriptionPlain : '',
       postedAt: typeof j.createdAt === 'number' ? j.createdAt : undefined,
+      // Lever's posting uuid; the v0 board API exposes no employer requisition
+      // field, so requisitionId stays unset rather than being inferred.
+      externalId: coerceId(j.id),
     }));
   },
 };

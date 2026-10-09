@@ -28,16 +28,16 @@
  * Probing hits live third-party APIs, so honor CAREER_OPS_PORTALS to point at a
  * scratch portals file during tests/experiments.
  *
- * Issue #1864 — github.com/santifer/career-ops
+ * Issue #1864 — github.com/career-ops-hq/career-ops
  */
 
 import { readFileSync, existsSync, writeFileSync } from 'fs';
 import { dirname, join, resolve } from 'path';
-import { fileURLToPath, pathToFileURL } from 'url';
+import { fileURLToPath } from 'url';
 import * as yaml from 'js-yaml';
 import { renameSyncWithRetry } from './tracker-utils.mjs';
 
-import { makeHttpCtx } from './providers/_http.mjs';
+import { makeHttpCtx, isRefusedRedirectError } from './providers/_http.mjs';
 import greenhouse from './providers/greenhouse.mjs';
 import ashby from './providers/ashby.mjs';
 import lever from './providers/lever.mjs';
@@ -50,9 +50,13 @@ import bamboohr from './providers/bamboohr.mjs';
 import pinpoint from './providers/pinpoint.mjs';
 import rippling from './providers/rippling.mjs';
 import joinProvider from './providers/join.mjs';
+import { isMainModule } from './lib/is-main-module.mjs';
+import { getCareerOpsRoot } from './path-resolver.mjs';
+import { DEFAULT_SMALL_THRESHOLD, isSmallBoard, smallBoardDetail } from './lib/small-board.mjs';
 
 const CAREER_OPS = dirname(fileURLToPath(import.meta.url));
-const PORTALS_PATH = process.env.CAREER_OPS_PORTALS || join(CAREER_OPS, 'portals.yml');
+const DATA_ROOT = getCareerOpsRoot();
+const PORTALS_PATH = process.env.CAREER_OPS_PORTALS || join(DATA_ROOT, 'portals.yml');
 
 // Safe charset for a slug that will be interpolated into an ATS URL. Consistent
 // with the SLUG_RE guard in scan-ats-full.mjs and seeds/vc-portfolios.mjs — a
@@ -125,6 +129,7 @@ const USAGE = `Usage:
   node discover-ats.mjs --in companies.yml --summary  # human-readable table
   node discover-ats.mjs --in companies.yml --vendors gh,ashby,lever  # restrict probes
   node discover-ats.mjs --in companies.yml --vendors workday         # Workday only
+  node discover-ats.mjs --in companies.yml --small-threshold 10  # what counts as a small board (default ${DEFAULT_SMALL_THRESHOLD}, 0 = off)
   node discover-ats.mjs --self-test                   # inline test suite
   node discover-ats.mjs --help                        # print this usage block
 
@@ -308,8 +313,10 @@ const WORKDAY_SEGMENT_RE = /^[A-Za-z0-9_-]+$/;
 /**
  * Extract Workday coordinates {tenant, instance?, site} from a company's hints.
  * Accepts, in priority order:
- *   1. A full Workday URL in `workday`, `careers_url`, or `website`:
+ *   1. A full Workday URL in `workday`, `careers_url`, or `website`, either as a
+ *      careers page or as the CXS endpoint it resolves to:
  *      https://<tenant>.<instance>.myworkdayjobs.com[/<locale>]/<site>[/...]
+ *      https://<tenant>.<instance>.myworkdayjobs.com/wday/cxs/<tenant>/<site>[/jobs]
  *   2. An explicit object `workday: { tenant, site, instance? }`.
  * Returns null when no Workday coordinates are present. `instance` may be null
  * (caller then auto-probes WORKDAY_INSTANCES). Every returned segment is
@@ -331,13 +338,28 @@ export function parseWorkdayHint(company) {
 
   // 2. URL form — check every field that might carry a Workday link. No
   // substring pre-filter here (CodeQL js/incomplete-url-substring-sanitization):
-  // the anchored regex below is the actual gate and already rejects anything
+  // the anchored regexes below are the actual gate and already reject anything
   // that isn't a well-formed *.myworkdayjobs.com URL.
   const urlCandidates = [company.workday, company.careers_url, company.website]
     .filter((v) => typeof v === 'string');
   for (const raw of urlCandidates) {
-    // Mirrors the tenant regex in providers/workday.mjs resolveEndpoint().
-    const m = raw.match(/https?:\/\/([\w-]+)\.(wd[\w-]*)\.myworkdayjobs\.com\/(?:[a-z]{2}-[A-Z]{2}\/)?([^/?#]+)/);
+    // A CXS endpoint carries the site one level deeper, behind /wday/cxs/{tenant}/.
+    // It also matches the careers-page pattern below, which captures the literal
+    // `wday` as the site — here that lands in a generated portals.yml entry as
+    // `careers_url: https://{tenant}.{instance}.myworkdayjobs.com/wday`, a
+    // plausible-looking line for a board that doesn't exist (#3498). Checked
+    // first, same as providers/workday.mjs resolveEndpoint().
+    // Both patterns are anchored: unanchored, they match a Workday URL embedded
+    // anywhere in the candidate (e.g. `https://evil.example/r?next=https://acme
+    // .wd5.myworkdayjobs.com/Careers`), so a redirect wrapper silently yields
+    // coordinates for whatever tenant it carries. Anchoring is also what the
+    // comment above has always claimed this gate does.
+    const cxs = raw.match(/^https?:\/\/([\w-]+)\.(wd[\w-]*)\.myworkdayjobs\.com\/wday\/cxs\/[\w-]+\/([^/?#]+)(?:\/jobs)?(?:[/?#]|$)/);
+    // The tenant comes from the host, not from the /wday/cxs/{tenant}/ segment:
+    // these coordinates rebuild a careers URL host-first (buildWorkdayCandidates),
+    // and the host is what has to stay reachable.
+    const m = cxs
+      || raw.match(/^https?:\/\/([\w-]+)\.(wd[\w-]*)\.myworkdayjobs\.com\/(?:[a-z]{2}-[A-Z]{2}\/)?([^/?#]+)/);
     if (!m) continue;
     const [, tenant, instance, site] = m;
     if (clean(tenant) && clean(instance) && clean(site)) {
@@ -395,7 +417,25 @@ export function renderPortalEntry(match) {
   if (match.provider) lines.push(`    provider: ${match.provider}`);
   lines.push(`    enabled: true`);
   if (match.notes) lines.push(`    notes: ${yamlScalar(match.notes)}`);
+  // A comment, not a key: portals.yml still parses to the same fields, but the
+  // user sees the prompt next to the entry when they open the file (#4772).
+  if (match.smallBoard) lines.push(`    # verify: ${smallBoardDetail(match.jobCount)}`);
   return '\n' + lines.join('\n') + '\n';
+}
+
+/**
+ * Flag resolved boards that list few postings. Purely advisory: it adds a
+ * `smallBoard: true` field and never changes what resolves (#4772).
+ *
+ * @param {any[]} resolved
+ * @param {number} [threshold]
+ * @returns {any[]} the same array, entries mutated in place
+ */
+export function flagSmallBoards(resolved, threshold = DEFAULT_SMALL_THRESHOLD) {
+  for (const r of resolved) {
+    if (isSmallBoard(r.jobCount, threshold)) r.smallBoard = true;
+  }
+  return resolved;
 }
 
 /** Normalize a careers_url/api for dedupe comparison: lowercase, strip trailing slash. */
@@ -502,6 +542,18 @@ export async function probeVendor(company, candidate, ctx) {
     // what lets the caller tell a definitive 404 from a transient 5xx instead of
     // re-parsing the message text (#2883).
     if (Number.isInteger(err?.status)) out.httpStatus = err.status;
+    // A refused redirect has no status at all: it is a bare `TypeError: fetch
+    // failed`, and the vendor's actual answer lives one level down in
+    // err.cause. Recording only err.message discarded that answer, so a
+    // BambooHR tenant that does not exist — answered with `302 →
+    // www.bamboohr.com`, not a 404 — reached the user as the single word
+    // "fetch failed" under advice to re-run it. Same reasoning as the
+    // httpStatus line above: keep the discriminator on the object rather than
+    // re-parsing prose downstream (#3788).
+    if (isRefusedRedirectError(err)) {
+      out.refusedRedirect = true;
+      out.error = `${out.error} (${err.cause.message})`;
+    }
     return out;
   }
 }
@@ -536,6 +588,7 @@ export async function resolveWorkday(company, coords, ctx) {
   const tried = [];
   let emptyUrl = null;
   let lastError;
+  let lastRefusedRedirect = false;
 
   for (const candidate of candidates) {
     tried.push(candidate.careers_url);
@@ -561,11 +614,22 @@ export async function resolveWorkday(company, coords, ctx) {
       if (!emptyUrl) emptyUrl = candidate.careers_url;
     } catch (err) {
       lastError = err?.message || String(err);
+      // The file's second `.fetch(` site, and workday.mjs passes
+      // redirect:'error' too — so a Workday host that redirects arrives here as
+      // the same bare "fetch failed" probeVendor used to report. Keeping the
+      // cause costs nothing and stops the two error paths from describing the
+      // same failure differently (#3788).
+      if (isRefusedRedirectError(err)) {
+        lastError = `${lastError} (${err.cause.message})`;
+        lastRefusedRedirect = true;
+      } else {
+        lastRefusedRedirect = false;
+      }
     }
   }
   return emptyUrl
     ? { status: 'empty', tried, careers_url: emptyUrl }
-    : { status: 'error', tried, detail: lastError };
+    : { status: 'error', tried, detail: lastError, refusedRedirect: lastRefusedRedirect };
 }
 
 /**
@@ -595,12 +659,27 @@ export async function resolveCompany(company, { vendors = VENDOR_ORDER, ctx, inc
       if (cfg.api) resolved.api = cfg.api(candidate.slug);
       return { resolved };
     }
-    if (result.status === 'empty') {
+    if (result.status === 'empty' && candidate.vendor === 'smartrecruiters') {
+      // SmartRecruiters' public postings API answers 200 with totalFound:0
+      // for ANY slug, including one that does not exist — unlike every other
+      // probed vendor, "empty" here establishes nothing. Counting it in
+      // emptyBoards let a single phantom hit outrank a real "not found"
+      // verdict from every other vendor, since emptyBoards is checked first
+      // in the reason ladder below: an unmatched company name would read as
+      // "board(s) found but currently list 0 jobs — re-run later", advising
+      // a retry that can never produce a different answer (#4179). Silently
+      // excluded from both emptyBoards and errors[] — the vendor still shows
+      // up in triedVendors, it just contributes no verdict either way. The
+      // accepted cost: a genuinely existing SmartRecruiters board with zero
+      // OPEN postings right now also reads as "not found" instead of "found,
+      // empty" — cheaper than every unmatched name reading as "found".
+    } else if (result.status === 'empty') {
       emptyBoards.push({ vendor: candidate.vendor, careers_url: candidate.careers_url });
     } else {
       /** @type {any} */
       const entry = { vendor: candidate.vendor, error: result.error };
       if (Number.isInteger(result.httpStatus)) entry.httpStatus = result.httpStatus;
+      if (result.refusedRedirect) entry.refusedRedirect = true;
       if (isDefinitiveAbsence(result)) entry.definitive = true;
       errors.push(entry);
     }
@@ -617,7 +696,15 @@ export async function resolveCompany(company, { vendors = VENDOR_ORDER, ctx, inc
       // Use the host resolveWorkday actually confirmed empty, not always wd1.
       emptyBoards.push({ vendor: 'workday', careers_url: wd.careers_url });
     } else if (wd.detail) {
-      errors.push({ vendor: 'workday', error: wd.detail });
+      /** @type {any} */
+      const wdEntry = { vendor: 'workday', error: wd.detail };
+      // Carried so errors[] describes a Workday refusal the same way it
+      // describes a BambooHR one. It cannot reach the reason ladder — the
+      // refused-redirect branch is guarded by !coords and a Workday probe only
+      // runs WITH coords — but a machine reading errors[] should not have to
+      // know that (#3788).
+      if (wd.refusedRedirect) wdEntry.refusedRedirect = true;
+      errors.push(wdEntry);
     }
   }
 
@@ -629,36 +716,59 @@ export async function resolveCompany(company, { vendors = VENDOR_ORDER, ctx, inc
   const workdayHintProvided = includeWorkday
     && (typeof company.workday === 'string' ? !!company.workday.trim()
       : (company.workday && typeof company.workday === 'object'));
+  // A failure is SETTLED when the vendor answered and re-running the identical
+  // probe cannot produce a different answer. Two ways that happens, and they
+  // mean different things:
+  //
+  //   - a definitive 404/410 — the board is not there (#2883);
+  //   - a refused redirect — the vendor pointed us off-tenant, which says "not
+  //     this slug", NOT "no board". BambooHR does not 404 an unknown tenant; it
+  //     answers `302 → www.bamboohr.com`. MaRS Discovery District redirects on
+  //     the derived `mars-discovery-district` and returns three jobs on
+  //     `marsdd`, so calling that absence would be as wrong as calling it
+  //     transient (#3788).
+  //
+  // Both are settled, so neither should advise re-running the same probe; only
+  // the first establishes absence, which is why refusedRedirect gets its own
+  // verdict below instead of joining isDefinitiveAbsence().
+  const isSettled = (e) => isDefinitiveAbsence(e) || e.refusedRedirect === true;
   const reason = emptyBoards.length
     ? 'board(s) found but currently list 0 jobs — re-run later or force-add manually'
     // Every probe errored and nothing was confirmed absent or empty — don't
     // claim "no board found", the status is unknown.
     //
-    // Unless every failure was DEFINITIVE. A 404 from Greenhouse/Ashby/Lever is
+    // Unless every failure was SETTLED. A 404 from Greenhouse/Ashby/Lever is
     // an answer, not a hiccup: the board is not there and re-running will say so
     // again. Advising a retry in that case erased the difference between "this
     // company has no board" and "the network hiccuped", which is exactly the
     // pair a user pruning portals.yml has to tell apart (#2883). One transient
     // failure among them is enough to leave the question open — that vendor
     // never answered, so absence is not established.
-    : (errors.length && !coords && !errors.every(isDefinitiveAbsence))
+    : (errors.length && !coords && !errors.every(isSettled))
       ? 'probe error(s) occurred — board status unknown, see errors[] and re-run'
-      // A hint was given but rejected by parseWorkdayHint (bad chars, missing
-      // tenant/site): tell the user to fix it, not to add one.
-      : (workdayHintProvided && !coords)
-        ? 'Workday hint given but rejected (invalid/missing tenant or site) — check the `workday` field and re-run'
-        : coords
-          ? 'Workday coordinates given but no live board with open jobs found at the probed host(s).'
-          // Nothing was probeable: every vendor's own contract rejected this
-          // slug's shape, so no board was ruled out — say that, rather than
-          // implying we looked and found nothing.
-          : (!candidates.length && unsupported.length)
-            ? `slug "${company.slug || deriveSlug(company.name)}" is not a valid board slug for any probed vendor `
-              + `(${unsupported.join(', ')}) — nothing was probed; fix the \`slug\` field and re-run.`
-            // VENDOR_ORDER covers eleven vendors now, so name none of them here.
-            : 'no supported ATS board found. If this company uses Workday, add a hint — '
-              + 'a full careers URL (workday: https://<tenant>.wd<N>.myworkdayjobs.com/<site>) or '
-              + 'workday: {tenant, site} — and re-run; discover-ats will confirm and add it.';
+      // Settled, but by a redirect rather than a 404: the actionable fix is the
+      // slug, not a retry and not a Workday hint.
+      : (errors.length && !coords && errors.some((e) => e.refusedRedirect))
+        ? 'vendor(s) redirected off-tenant ('
+          + errors.filter((e) => e.refusedRedirect).map((e) => e.vendor).join(', ')
+          + ') — the slug is wrong, or no board exists under it. The same probe '
+          + 'will redirect again, so set an explicit `slug` and re-run.'
+        // A hint was given but rejected by parseWorkdayHint (bad chars, missing
+        // tenant/site): tell the user to fix it, not to add one.
+        : (workdayHintProvided && !coords)
+          ? 'Workday hint given but rejected (invalid/missing tenant or site) — check the `workday` field and re-run'
+          : coords
+            ? 'Workday coordinates given but no live board with open jobs found at the probed host(s).'
+            // Nothing was probeable: every vendor's own contract rejected this
+            // slug's shape, so no board was ruled out — say that, rather than
+            // implying we looked and found nothing.
+            : (!candidates.length && unsupported.length)
+              ? `slug "${company.slug || deriveSlug(company.name)}" is not a valid board slug for any probed vendor `
+                + `(${unsupported.join(', ')}) — nothing was probed; fix the \`slug\` field and re-run.`
+              // VENDOR_ORDER covers eleven vendors now, so name none of them here.
+              : 'no supported ATS board found. If this company uses Workday, add a hint — '
+                + 'a full careers URL (workday: https://<tenant>.wd<N>.myworkdayjobs.com/<site>) or '
+                + 'workday: {tenant, site} — and re-run; discover-ats will confirm and add it.';
 
   /** @type {any} */
   const unresolved = { name: company.name, triedVendors, reason };
@@ -716,7 +826,8 @@ function printSummary({ resolved, unresolved, duplicates }) {
     console.log('  ' + '-'.repeat(90));
     for (const r of resolved) {
       console.log('  ' + String(r.name).substring(0, 22).padEnd(24)
-        + String(r.vendor).padEnd(12) + String(r.jobCount).padEnd(7) + r.careers_url);
+        + String(r.vendor).padEnd(12) + String(r.jobCount).padEnd(7) + r.careers_url
+        + (r.smallBoard ? `  [small board — verify ownership]` : ''));
     }
     console.log('');
   }
@@ -838,6 +949,12 @@ function runSelfTest() {
   const q = renderPortalEntry({ name: 'Foo: Bar', careers_url: 'https://jobs.ashbyhq.com/foo' });
   check(q.includes('name: "Foo: Bar"'), 'renderPortalEntry quotes name with colon');
 
+  // small-board flag (#4772): advisory field + `# verify:` comment, only when flagged
+  const sb = flagSmallBoards([{ name: 'A', jobCount: 1 }, { name: 'B', jobCount: 6 }]);
+  check(sb[0].smallBoard === true && sb[1].smallBoard === undefined, 'flagSmallBoards flags only boards at or under the threshold');
+  check(renderPortalEntry({ name: 'A', careers_url: 'https://x', smallBoard: true, jobCount: 1 }).includes('# verify:'), 'renderPortalEntry adds # verify: for a small board');
+  check(!renderPortalEntry({ name: 'B', careers_url: 'https://x', jobCount: 6 }).includes('# verify:'), 'renderPortalEntry omits # verify: for a larger board');
+
   // dedupeAgainstPortals
   const existing = [{ name: 'Adyen', careers_url: 'https://job-boards.greenhouse.io/adyen/' }];
   const d1 = dedupeAgainstPortals([{ name: 'Adyen', careers_url: 'x' }], existing);
@@ -900,8 +1017,8 @@ function runSelfTest() {
 // --write is the explicit opt-in to modify portals.yml (a user-layer file);
 // without it the run is preview-only. --dry-run is accepted as a harmless alias
 // for "don't write" (the default) so an older invocation never surprises anyone.
-const KNOWN_FLAGS = ['--in', '--vendors', '--write', '--dry-run', '--summary', '--self-test', '--help', '-h'];
-const VALUE_FLAGS = ['--in', '--vendors'];
+const KNOWN_FLAGS = ['--in', '--vendors', '--small-threshold', '--write', '--dry-run', '--summary', '--self-test', '--help', '-h'];
+const VALUE_FLAGS = ['--in', '--vendors', '--small-threshold'];
 
 function parseArgs(argv) {
   const args = argv.slice(2);
@@ -952,7 +1069,16 @@ function parseArgs(argv) {
   // Positional args (not flags, not a consumed flag value) are company names.
   const names = args.filter((a, idx) => !a.startsWith('-') && !consumedValueIndices.has(idx));
 
+  // Same shape check as audit-portals.mjs: a non-negative number, 0 = off.
+  const rawThreshold = valueOf('--small-threshold');
+  const smallThreshold = rawThreshold === null ? DEFAULT_SMALL_THRESHOLD : Number(rawThreshold);
+  if (!Number.isFinite(smallThreshold) || smallThreshold < 0 || String(rawThreshold).trim() === '') {
+    console.error(`Error: --small-threshold expects a non-negative number, got "${rawThreshold}"`);
+    process.exit(1);
+  }
+
   return {
+    smallThreshold,
     inPath: valueOf('--in'),
     vendors,
     includeWorkday,
@@ -1000,6 +1126,8 @@ async function main() {
   }
 
   const { resolved, unresolved } = await runDiscovery(companies, { vendors: opts.vendors, includeWorkday: opts.includeWorkday });
+  // Advisory only: resolution and exit codes are unchanged (#4772).
+  flagSmallBoards(resolved, opts.smallThreshold);
 
   // Dedupe resolved matches against the existing tracker.
   let existingEntries = [];
@@ -1058,7 +1186,7 @@ async function main() {
 }
 
 // --- Run (CLI only; guarded so the module is safely importable for tests) ---
-if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+if (isMainModule(import.meta.url)) {
   main().catch((err) => {
     console.error(`discover-ats: ${err?.stack || err?.message || err}`);
     process.exit(1);

@@ -54,19 +54,27 @@
  *      node negotiation-roi.mjs --wage 45 --occurrences 52       (direct annual count)
  *      node negotiation-roi.mjs --self-test
  *
- * Issue #2949 — github.com/santifer/career-ops
+ * Issue #2949 — github.com/career-ops-hq/career-ops
  */
 
 import { readFileSync, existsSync } from 'fs';
-import { dirname, join } from 'path';
-import { fileURLToPath, pathToFileURL } from 'url';
+import { join } from 'path';
+import { fileURLToPath } from 'url';
 import { spawnSync } from 'child_process';
 import { parseStories } from './match-star.mjs';
 import { flagValue, hasFlag } from './lib/cli-flags.mjs';
+import { isMainModule } from './lib/is-main-module.mjs';
+import { getCareerOpsRoot } from './path-resolver.mjs';
 
-const CAREER_OPS = dirname(fileURLToPath(import.meta.url));
-const STORY_BANK_PATH = join(CAREER_OPS, 'interview-prep', 'story-bank.md');
-const CV_PATH = join(CAREER_OPS, 'cv.md');
+const DATA_ROOT = getCareerOpsRoot();
+// BOTH from the data root, because the v1 safety gate compares them: a claim
+// survives only if its number also appears verbatim in cv.md. Resolving the
+// story bank from the CODE root and cv.md from the DATA root pointed the two
+// halves of one comparison at two different installs — so for any configured
+// data root the gate read a story bank that is not there, found no claims, and
+// produced an empty draft that looks like "you have no quantified stories".
+const STORY_BANK_PATH = join(DATA_ROOT, 'interview-prep', 'story-bank.md');
+const CV_PATH = join(DATA_ROOT, 'cv.md');
 
 // ── Frequency vocabulary ─────────────────────────────────────────────
 // Occurrences per year, business-cadence convention (matches how a candidate
@@ -699,6 +707,6 @@ function main() {
   }
 }
 
-if (process.argv[1] && pathToFileURL(process.argv[1]).href === import.meta.url) {
+if (isMainModule(import.meta.url)) {
   main();
 }

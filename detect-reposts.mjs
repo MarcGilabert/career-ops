@@ -53,21 +53,26 @@
  *      node detect-reposts.mjs --self-test
  *      node detect-reposts.mjs --help
  *
- * Issue #1205 — github.com/santifer/career-ops
+ * Issue #1205 — github.com/career-ops-hq/career-ops
  */
 
 import { readFileSync, existsSync, writeFileSync, mkdtempSync, rmSync } from 'fs';
 import { join, dirname } from 'path';
 import { tmpdir } from 'os';
-import { fileURLToPath, pathToFileURL } from 'url';
+import { fileURLToPath } from 'url';
 // Namespace import, not default: js-yaml 5.x drops the default export, and
 // #2656 migrated the rest of the repo for exactly that reason.
 import * as yaml from 'js-yaml';
 
+import { roleFuzzyMatch } from './role-matcher.mjs';
+import { getCareerOpsRoot } from './path-resolver.mjs';
 import { normalizeCompanyName } from './invite-match.mjs';
-import { flagValue, validateFlags } from './lib/cli-flags.mjs';
+import { flagValue, validateFlags, safeIntFlag } from './lib/cli-flags.mjs';
+import { isMainModule } from './lib/is-main-module.mjs';
+import { parseDate } from './lib/parse-date.mjs';
+import { parseScanHistoryLine, scanHistoryLineHasColumn } from './lib/scan-history-columns.mjs';
 
-const CAREER_OPS = dirname(fileURLToPath(import.meta.url));
+const CAREER_OPS = getCareerOpsRoot();
 const SCAN_HISTORY_PATH = join(CAREER_OPS, 'data/scan-history.tsv');
 // Same resolution scan.mjs uses, so a sandboxed run overrides both together.
 const PORTALS_PATH = process.env.CAREER_OPS_PORTALS || join(CAREER_OPS, 'portals.yml');
@@ -105,57 +110,24 @@ const summaryMode = args.includes('--summary');
 const selfTestMode = args.includes('--self-test');
 // Both numeric flags read through flagValue, so `--min-span=7` behaves exactly
 // like `--min-span 7` — the defect lib/cli-flags.mjs exists to keep the next
-// script from rediscovering. Anything that is not a plain non-negative integer
-// falls back to the default, which is the behaviour --window already had for an
-// unparseable value.
-//
-// The whole string must match, and it must not be negative. parseInt() alone
-// satisfies neither: it reads "7abc" as 7, and it reads "-5" as -5 — and a
-// negative floor silently disables the very guard --min-span exists to set,
-// reporting concurrent openings as reposts again with no indication that the
-// value was rejected. A negative --window likewise rejects every cluster.
-//
-// Tested against Number()/Number.isInteger() as well: Number('') is 0, so an
-// empty value (`--min-span=`) would read as a deliberate zero and disable the
-// floor. A total regex has no such hole.
-// The regex is not sufficient on its own: it happily accepts a 400-digit run of
-// nines, which Number() turns into Infinity. That reproduces this file's
-// original defect in a new place — an infinite floor rejects every cluster, an
-// infinite window is unbounded, and JSON.stringify writes Infinity as `null`,
-// so metadata reports a value that is not the one in effect. A merely UNSAFE
-// integer is the quiet version of the same thing: 9007199254740993 silently
-// becomes ...992. isSafeInteger rejects both.
-const intFlag = (flag, fallback) => {
-  const raw = flagValue(args, flag);
-  if (raw === undefined) return fallback;
-  const text = String(raw).trim();
-  if (!/^\d+$/.test(text)) return fallback;
-  const parsed = Number(text);
-  if (!Number.isSafeInteger(parsed)) return fallback;
-  return parsed;
-};
+// script from rediscovering. The rules and the reasoning now live in
+// lib/cli-flags.mjs's safeIntFlag() so process-quality.mjs stops being the
+// file that lacks them (#2982); the behaviour here is unchanged, including
+// the deliberate fall back to the default rather than an exit.
+const intFlag = (flag, fallback) => safeIntFlag(flagValue(args, flag), fallback);
 const windowDays = intFlag('--window', DEFAULT_WINDOW_DAYS);
 const minSpanDays = intFlag('--min-span', MIN_REPOST_SPAN_DAYS);
 
 // --- Date helpers ---
-function parseDate(dateStr) {
-  const iso = String(dateStr || '').trim();
-  if (!/^\d{4}-\d{2}-\d{2}$/.test(iso)) return null;
-  const date = new Date(`${iso}T00:00:00Z`);
-  if (Number.isNaN(date.getTime()) || date.toISOString().slice(0, 10) !== iso) return null;
-  return date;
-}
-
 function daysBetween(d1, d2) {
   return Math.round((d2.getTime() - d1.getTime()) / (1000 * 60 * 60 * 24));
 }
 
 // --- Parse scan-history.tsv ---
-// Format: url, first_seen, portal, title, company, status, location, ...,
-//         normalized_company (trailing col 12, additive — see scan.mjs).
-// The normalized_company column is preferred as the clustering key when
-// present; rows written before it existed (fewer columns) simply lack it and
-// carry `normCompany: ''`, so a consumer normalizes the raw company on the fly.
+// Columns as declared in lib/scan-history-columns.mjs. The normalized_company
+// column is preferred as the clustering key when present; rows written before
+// it existed simply lack it and carry `normCompany: ''`, so a consumer
+// normalizes the raw company on the fly.
 export function parseScanHistory(content) {
   const lines = content.split('\n').filter(line => line.trim());
   if (lines.length === 0) return [];
@@ -165,24 +137,23 @@ export function parseScanHistory(content) {
   // don't have a header row, and slice(1) would silently lose row 0.
   const hasHeader = /^\s*url\s*\t/i.test(lines[0]);
   for (const line of lines.slice(hasHeader ? 1 : 0)) {
-    const cols = line.split('\t');
-    if (cols.length < 5) continue;
-    const [url, firstSeen, portal = '', title = '', company = '', status = 'added', location = ''] = cols;
-    const date = parseDate(firstSeen);
-    if (!url || !date) continue;
+    if (!scanHistoryLineHasColumn(line, 'company')) continue;
+    const row = parseScanHistoryLine(line);
+    const date = parseDate(row.first_seen);
+    if (!row.url || !date) continue;
     rows.push({
-      url: url.trim(),
+      url: row.url.trim(),
       date,
-      dateStr: firstSeen.trim(),
-      portal: portal.trim(),
-      title: title.trim(),
-      company: company.trim(),
-      status: (status || 'added').trim(),
-      location: (location || '').trim(),
-      // Trailing normalized-company key (col 12, 0-indexed 11). '' for older
-      // rows that predate the column — companyKey() falls back to normalizing
-      // the raw name so old and new rows still cluster on the same key.
-      normCompany: (cols[11] || '').trim(),
+      dateStr: row.first_seen.trim(),
+      portal: row.portal.trim(),
+      title: row.title.trim(),
+      company: row.company.trim(),
+      status: (row.status || 'added').trim(),
+      location: row.location.trim(),
+      // '' for older rows that predate the normalized_company column —
+      // companyKey() falls back to normalizing the raw name so old and new
+      // rows still cluster on the same key.
+      normCompany: row.normalized_company.trim(),
     });
   }
   return rows;
@@ -784,7 +755,7 @@ function runSelfTest() {
 }
 
 // --- Run (CLI only; guarded so the module is safely importable for tests) ---
-if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+if (isMainModule(import.meta.url)) {
   // Replaces a bare --help check that never looked at the other flags, so a
   // mistyped --window was ignored and the scan silently used the 90-day
   // default instead of the window that was asked for (#2919). validateFlags

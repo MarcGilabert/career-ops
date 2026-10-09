@@ -44,7 +44,7 @@ system/user data-contract layers live in [../ARCHITECTURE.md](../ARCHITECTURE.md
 3. **Classify**: Detect archetype (1 of 6 types)
 4. **Evaluate**: 7 blocks (A-G):
    - A: Role summary
-   - B: CV match (gaps + mitigation)
+   - B: CV match (per-requirement importance + gaps + mitigation)
    - C: Level strategy
    - D: Comp research (WebSearch)
    - E: CV personalization plan
@@ -102,6 +102,7 @@ Scripts maintain data consistency:
 | `verify-pipeline.mjs` | Health check: statuses, duplicates, links |
 | `dedup-tracker.mjs` | Removes duplicate entries by company+role |
 | `normalize-statuses.mjs` | Maps status aliases to canonical values |
+| `fix-report-links.mjs` | Rewrites Report cells that link to a missing file to `—` (previewable, backed up) |
 | `cv-sync-check.mjs` | Validates setup consistency |
 
 ## Dashboard TUI
