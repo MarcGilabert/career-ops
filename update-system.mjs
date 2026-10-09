@@ -276,6 +276,7 @@ const SYSTEM_PATHS = [
   'lib/small-board.mjs',
   'lib/is-main-module.mjs',
   'lib/mjs-files.mjs',
+  'lib/walk-tree.mjs',
   'lib/scratch-dirs.mjs',
   'lib/outcome-dir.mjs',
   'lib/outcome-types.mjs',
