@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { Bell, CircleHelp, Sparkles, ArrowRight } from "lucide-react";
@@ -14,6 +14,7 @@ import { DecisionCard } from "@/components/home/decision-card";
 import { QuickEvaluate } from "@/components/quick-evaluate";
 import { scoreNum } from "@/lib/format";
 import { pickAwaitingDecision } from "@/lib/home/awaiting.mjs";
+import { resolveHeroState, mayClaimAllClear, showsQueue } from "@/lib/home/hero-state.mjs";
 
 // The retention "Today": a dual-loop action queue (the maintainer's
 // "N new matches this week · M follow-ups due"). SUPPLY loop = fresh free-scan
@@ -34,13 +35,55 @@ export function TodayDashboard({
   const [nextUpcoming, setNextUpcoming] = useState<FollowUp | null>(null);
   const [fresh, setFresh] = useState<DiscoveredOffer[]>([]);
   const [freshCount, setFreshCount] = useState(0);
+  // Whether the two client loops have answered, so the headline can tell
+  // "nothing is due" apart from "nothing has loaded" (see lib/home/hero-state.mjs).
+  // `failed` is tracked separately because both fetches swallow their errors: a
+  // silent failure leaves every counter at 0, which used to read as all-clear
+  // forever.
+  const [loops, setLoops] = useState<"pending" | "settled" | "failed">("pending");
   const router = useRouter();
   const dateLabel = useMemo(() => new Date().toLocaleDateString("en-US", { weekday: "long", month: "short", day: "numeric" }), []);
 
+  // Monotonic request id. A refetch can be triggered by a worker finishing
+  // (`co-job-done`) while an earlier one is still in flight, and the responses
+  // can land in either order — so a slow FIRST request could overwrite the
+  // result of a fast SECOND one and put a stale verdict back on screen. Only the
+  // newest request is allowed to write state.
+  const requestId = useRef(0);
+
   const refetch = useCallback(() => {
+    const id = ++requestId.current;
+    const current = () => requestId.current === id;
+
+    // Back to pending for the duration. Without this the headline keeps the
+    // PREVIOUS verdict while new data loads — including "You're all caught up."
+    // after a worker has just written a row that may well contradict it.
+    setLoops("pending");
+
+    // Both loops must answer before the headline may claim anything. Tracked as
+    // a pair: one failure is enough to make "all caught up" unprovable, so the
+    // hero degrades to `unavailable` rather than to silence.
+    let failed = false;
+    const settle = (() => {
+      let left = 2;
+      return () => {
+        left -= 1;
+        if (left === 0 && current()) setLoops(failed ? "failed" : "settled");
+      };
+    })();
     fetch("/api/followups")
-      .then((r) => r.json())
+      .then((r) => {
+        if (!r.ok) throw new Error(`HTTP ${r.status}`);
+        return r.json();
+      })
       .then((d) => {
+        // A 200 carrying `available: false` is the route's own way of saying it
+        // could not read the cadence — the script is missing, or its output did
+        // not parse. Checking only r.ok treated that as an empty-but-valid
+        // answer, so the one path the route uses to report failure still ended
+        // in "You're all caught up."
+        if (d?.available === false) throw new Error("followups unavailable");
+        if (!current()) return;
         // /api/followups already filters to urgency 'urgent'/'overdue' — due
         // now, never 'waiting'/'cold' (#86). Both count toward "due"; a
         // missing metadata.overdue must read as 0 due, never as "every entry
@@ -49,16 +92,26 @@ export function TodayDashboard({
         setOverdue((d.metadata?.overdue ?? 0) + (d.metadata?.urgent ?? 0));
         setNextUpcoming(d.nextUpcoming ?? null);
       })
-      .catch(() => {});
+      .catch(() => {
+        failed = true;
+      })
+      .finally(settle);
     fetch("/api/whats-new")
-      .then((r) => r.json())
+      .then((r) => {
+        if (!r.ok) throw new Error(`HTTP ${r.status}`);
+        return r.json();
+      })
       .then((d) => {
         const offers = Array.isArray(d.offers) ? d.offers : [];
         const count = Number(d.count);
+        if (!current()) return;
         setFresh(offers);
         setFreshCount(Number.isFinite(count) ? Math.max(0, Math.trunc(count)) : offers.length);
       })
-      .catch(() => {});
+      .catch(() => {
+        failed = true;
+      })
+      .finally(settle);
   }, []);
 
   useEffect(() => {
@@ -80,7 +133,8 @@ export function TodayDashboard({
   const awaiting = useMemo(() => pickAwaitingDecision(applications, scoreNum), [applications]);
 
   const newThisWeek = freshCount;
-  const allClear = newThisWeek === 0 && overdue === 0 && awaiting.length === 0;
+  const heroState = resolveHeroState({ loops, newThisWeek, overdue, awaitingCount: awaiting.length });
+  const allClear = mayClaimAllClear(heroState);
   const inboxUrls = useMemo(() => new Set(inbox.map((j) => j.url)), [inbox]);
 
   return (
@@ -93,8 +147,23 @@ export function TodayDashboard({
           <p className="font-mono text-xs uppercase tracking-[0.2em] text-muted">
             <span className="text-faint">//</span> today · <span className="tabular-nums">{dateLabel}</span>
           </p>
-          <h1 className={`${instrumentSerif.className} mt-3 text-4xl leading-[1.05] text-landing md:text-5xl`}>
-            {allClear ? (
+          <h1
+            className={`${instrumentSerif.className} mt-3 text-4xl leading-[1.05] text-landing md:text-5xl`}
+            // The counts arrive after paint, so the headline rewrites itself once.
+            // Announce it politely rather than interrupting whatever a screen
+            // reader is already saying.
+            aria-live="polite"
+            aria-busy={heroState === "loading"}
+          >
+            {heroState === "loading" ? (
+              // Deliberately NOT "You're all caught up." — see lib/home/hero-state.mjs.
+              // A skeleton bar rather than placeholder text: the real headline is
+              // one line of large serif, so text here would be read out and then
+              // immediately replaced.
+              <span className="inline-block h-[1em] w-[min(20ch,80%)] animate-pulse rounded-md bg-muted/25 align-middle" aria-label="Checking your queue" />
+            ) : heroState === "unavailable" ? (
+              <>Couldn&apos;t check your queue.</>
+            ) : allClear ? (
               <>You&apos;re all caught up.</>
             ) : (
               <>
@@ -109,11 +178,23 @@ export function TodayDashboard({
                     <span className="text-brand tabular-nums">{overdue}</span> follow-up{overdue === 1 ? "" : "s"} due
                   </>
                 )}
+                {newThisWeek === 0 && overdue === 0 && showsQueue(heroState) && <>Your queue is waiting.</>}
               </>
             )}
           </h1>
           <p className="mt-4 max-w-xl text-sm text-muted">
-            {allClear ? "I'll keep scanning the market in the background and surface anything that fits." : "Your action queue for today — discovery and follow-ups, in one place."}
+            {heroState === "loading"
+              ? "Reading your tracker and the latest scan results…"
+              : heroState === "unavailable"
+                ? "Follow-ups or new matches could not be read just now, so this may be missing work. Reload, or open the pipeline directly."
+                : heroState === "queue-partial"
+                  ? // The counts above are real and worth acting on; the warning is
+                    // that they are not the whole picture. Saying only the first
+                    // would present a partial queue as the complete one.
+                    "Here's what I could read — one source didn't answer, so there may be more than this."
+                  : allClear
+                    ? "I'll keep scanning the market in the background and surface anything that fits."
+                    : "Your action queue for today — discovery and follow-ups, in one place."}
           </p>
           <div className="mt-6 flex flex-wrap gap-2.5">
             <Link href="/explore" className="inline-flex items-center gap-2 rounded-full bg-brand px-5 py-2.5 text-sm font-medium text-brand-foreground transition hover:bg-brand-200 max-sm:min-h-[44px]">
