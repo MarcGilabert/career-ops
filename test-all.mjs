@@ -8187,14 +8187,16 @@ try {
   if (
     historyRow.split('\t').length === SCAN_HISTORY_COLUMNS.length && // every declared column, empty ones included
     !historyRow.includes('\n') && !historyRow.includes('\r') &&
-    history.posted_at === '' && // no postedAt on hostileOffer
-    history.trust_score === '' && history.trust_flags === '' && // no trust signal
+    !historyRow.split('\t').some(col => /[\r\n\t]/.test(col)) &&
+    history.posted_at === '' &&
+    history.trust_score === '' && history.trust_flags === '' &&
     history.url === 'https://jobs.example.com/123|evil' &&
     history.title.includes('- [ ] https://evil.example/job') &&
     history.company === "'=ACME\\Corp | R&D" &&
     history.location === "'@Remote EU" &&
     history.requisition_id === "'=R1 DROP x" &&
-    history.language === "'@en -GB"
+    history.language === "'@en -GB" &&
+    history.listing_key === ''
   ) {
     pass('scan-history writer preserves row shape and neutralizes spreadsheet formulas');
   } else {
@@ -8218,10 +8220,12 @@ try {
   const datedHistory = parseScanHistoryLine(formatScanHistoryRow(datedOffer, '2026-07-09'));
   const noDateHistory = parseScanHistoryLine(formatScanHistoryRow({ ...datedOffer, postedAt: undefined }, '2026-07-09'));
   if (
-    datedHistory.posted_at === '2026-06-18' && // epoch ms → YYYY-MM-DD
-    datedHistory.normalized_company === 'acme' && // normalized company key (#2093)
-    noDateHistory.posted_at === '' && // missing postedAt → empty, never a bogus date
-    noDateHistory.normalized_company === 'acme'
+    datedHistory.posted_at === '2026-06-18' &&
+    datedHistory.normalized_company === 'acme' &&
+    datedHistory.listing_key === '' &&
+    noDateHistory.posted_at === '' &&
+    noDateHistory.normalized_company === 'acme' &&
+    noDateHistory.listing_key === ''
   ) {
     pass('scan-history writer appends postedAt as an ISO trailing column (empty when absent)');
   } else {
@@ -8256,8 +8260,9 @@ try {
   const cleanHist = parseScanHistoryLine(formatScanHistoryRow(cleanOffer, '2026-07-09'));
   if (
     flaggedHist.trust_score === '60' && flaggedHist.trust_flags === 'missing_apply_url,suspicious_domain' &&
-    flaggedHist.normalized_company === 'acme' && // normalized company key (#2093)
-    cleanHist.trust_score === '' && cleanHist.trust_flags === '' // score 100 → not flagged → empty
+    flaggedHist.normalized_company === 'acme' &&
+    flaggedHist.listing_key === '' &&
+    cleanHist.trust_score === '' && cleanHist.trust_flags === '' && cleanHist.listing_key === ''
   ) {
     pass('scan-history writer appends trust score + flags trailing columns when flagged, empty otherwise (#1743)');
   } else {
@@ -17459,8 +17464,7 @@ try {
     { url: 'https://x.example/j/1', source: 'lever', title: 'Data Engineer', company: 'Acme', location: 'Remote', description: longJd },
     '2026-07-06',
   ));
-  if (/^[0-9a-f]{16}$/.test(withBody.fingerprint) && withBody.normalized_company === 'acme') {
-    pass('formatScanHistoryRow appends a fingerprint column for described offers');
+  if (/^[0-9a-f]{16}$/.test(withBody.fingerprint) && withBody.normalized_company === 'acme' && withBody.listing_key === '') {    pass('formatScanHistoryRow appends a fingerprint column for described offers');
   } else {
     fail(`formatScanHistoryRow row: fingerprint=${JSON.stringify(withBody.fingerprint)}, normalized_company=${JSON.stringify(withBody.normalized_company)}`);
   }
@@ -17468,8 +17472,7 @@ try {
     { url: 'https://x.example/j/2', source: 'greenhouse', title: 'Data Engineer', company: 'Acme', location: '' },
     '2026-07-06',
   ));
-  if (withoutBody.fingerprint === '' && withoutBody.normalized_company === 'acme') {
-    pass('formatScanHistoryRow leaves the fingerprint empty when no description is available');
+  if (withoutBody.fingerprint === '' && withoutBody.normalized_company === 'acme' && withoutBody.listing_key === '') {    pass('formatScanHistoryRow leaves the fingerprint empty when no description is available');
   } else {
     fail(`formatScanHistoryRow (no body) row: fingerprint=${JSON.stringify(withoutBody.fingerprint)}, normalized_company=${JSON.stringify(withoutBody.normalized_company)}`);
   }
